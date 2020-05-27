@@ -1,0 +1,123 @@
+---
+title: "R(t) vs. Facility Attributes"
+author: "Aurelia Augusta"
+date: "5/23/2020"
+output: pdf_document
+---
+
+```{r, message=FALSE, warning=FALSE}
+library(tidyverse)
+base::set.seed(31337)
+
+```
+
+```{r, message=FALSE}
+facility.rt <- readr::read_csv("facility_rts.csv")
+facility.attrs <- readr::read_csv("facility_attr.csv")
+
+facility.attrs <- facility.attrs %>%
+  # Make sure we have our essential columns
+  drop_na(name, location, status, pop_cleaned, capacity_cleaned, year_opened, security_class_cleaned) %>%
+  # Keep only the key columns
+  transmute(name, location, status, year_opened, security = security_class_cleaned, population = pop_cleaned, capacity = capacity_cleaned) %>%
+  # Double check to make sure we have no invalid values for pop or cap
+  filter(population != 0 && capacity != 0) %>%
+  # create our overcrowd_factor and whether we were pre or post 1995
+  mutate(overcrowd_factor = population/capacity, pre95 = year_opened < 1995) %>%
+  # squash case differences
+  mutate(status = tolower(status), security = tolower(security)) %>%
+  # remove closed facilities 
+  filter(status != "closed") %>%
+  # factorize key columns
+  mutate(security = as.factor(security))
+
+
+facility.rt <- facility.rt %>%
+  mutate(date = lubridate::ymd(date))
+
+facility.joined <- dplyr::inner_join(facility.rt, facility.attrs, by=c("facility" = "name"))
+```
+
+```{r, message=FALSE}
+construction <- facility.joined %>%
+  group_by(date, pre95) %>%
+  summarise(avg_ML = mean(ML), avg_Low_90 = mean(Low_90), avg_High_90 = mean(High_90))
+
+ggplot(construction, aes(x = date, y = avg_ML , ymin = avg_Low_90, ymax = avg_High_90, color= pre95, fill=pre95)) +
+  geom_line() +
+  geom_ribbon(alpha=.3) +
+  xlab("Date") +
+  ylab("R(t)") + 
+  labs(title="Pre-95 prisons vs. Post-95 Prisons", color="Pre-1995?", fill="Pre-1995?")
+
+overcrowded <- facility.joined %>%
+  group_by(date, overcrowded = overcrowd_factor > 1) %>%
+  summarise(avg_ML = mean(ML), avg_Low_90 = mean(Low_90), avg_High_90 = mean(High_90))
+
+
+ggplot(overcrowded, aes(x = date, y = avg_ML , ymin = avg_Low_90, ymax = avg_High_90, color= overcrowded, fill=overcrowded)) +
+  geom_line() +
+  geom_ribbon(alpha=.3) +
+  xlab("Date") +
+  ylab("R(t)") + 
+  labs(title="Overcrowded prisons vs. Overcrowded Prisons", color="Overcrowded?", fill="Overcrowded?")
+
+security <- facility.joined %>%
+  group_by(date, security) %>%
+  summarise(avg_ML = mean(ML), avg_Low_90 = mean(Low_90), avg_High_90 = mean(High_90))
+
+ggplot(security, aes(x = date, y = avg_ML , ymin = avg_Low_90, ymax = avg_High_90, color = security, fill = security)) +
+  geom_line() +
+  xlab("Date") +
+  ylab("R(t)") + 
+  labs(title="Security Class Comparison", color="Security", fill="Security")
+
+is_admin <- facility.joined %>%
+  group_by(date, is_admin = security == "administrative") %>%
+  summarise(avg_ML = mean(ML), avg_Low_90 = mean(Low_90), avg_High_90 = mean(High_90))
+
+ggplot(is_admin, aes(x = date, y = avg_ML , ymin = avg_Low_90, ymax = avg_High_90, color = is_admin, fill = is_admin)) +
+  geom_line() +
+  geom_ribbon(alpha=.3) + 
+  xlab("Date") +
+  ylab("R(t)") + 
+  labs(title="Is Administrative Facility", color="Administrative", fill="Administrative")
+```
+
+```{r}
+base::set.seed(31337)
+facility.lagged <- facility.joined %>%
+  group_by(facility) %>%
+  arrange(date, .by_group = TRUE) %>%
+  mutate(lag_ML = dplyr::lag(ML), lag_Low_90 = dplyr::lag(Low_90), lag_High_90 = dplyr::lag(High_90)) %>%
+  mutate(ML.within = ML - mean(ML, na.rm = TRUE),
+         lag_ML.within = lag_ML - mean(lag_ML, na.rm = TRUE),
+         lag_Low_90.within = lag_Low_90 - mean(lag_Low_90, na.rm =TRUE),
+         lag_High_90.within = lag_High_90 - mean(lag_High_90, na.rm = TRUE))
+
+
+part.train <- caret::createDataPartition(y = facility.lagged$ML.within, p = .2, list = FALSE)
+facility.train <- facility.lagged[part.train, ]
+facility.test  <- facility.lagged[-part.train, ]
+
+ggplot(facility.lagged, aes(x = lag_ML.within, y = ML.within)) + 
+  geom_point()
+
+ggplot(facility.lagged, aes(x = overcrowd_factor, y = ML.within)) +
+  geom_point()
+
+ggplot(facility.lagged, aes(x = population, y = ML.within)) +
+  geom_point()
+
+ggplot(facility.lagged, aes(x = security, y = ML)) +
+  geom_boxplot()
+
+f.lm <- stats::lm(ML.within ~ lag_ML.within + overcrowd_factor + population + pre95 + security, facility.lagged)
+f.lmer <- lme4::lmer(ML.within ~ (1 + overcrowd_factor + pre95 | security) + population, facility.lagged)
+summary(f.lm)
+summary(f.lmer)
+var.std <- vcov(f.lm)
+var.hs <- sandwich::vcovHC(f.lm, type="HC0")
+moulton <- sqrt(diag(var.hs) / diag(var.std))
+var.test(ML ~ security, facility.lagged)
+```
